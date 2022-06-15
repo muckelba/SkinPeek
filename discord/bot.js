@@ -22,7 +22,7 @@ import {
     skinNameAndEmoji, wait
 } from "../misc/util.js";
 import {RadEmoji, VPEmoji} from "./emoji.js";
-import {getBalance, getBundles, getNightMarket, getOffers} from "../valorant/shop.js";
+import {getBalance} from "../valorant/shop.js";
 import { getBattlepassProgress } from "../valorant/battlepass.js";
 import config, {saveConfig} from "../misc/config.js";
 import {
@@ -44,13 +44,21 @@ import {
     allStatsEmbed
 } from "./embed.js";
 import {
-    getQueueItemStatus,
-    processQueue,
+    getAuthQueueItemStatus,
+    processAuthQueue,
     queueCookiesLogin,
 } from "../valorant/authQueue.js";
 import {l, s} from "../misc/languages.js";
 import {login2FA, loginUsernamePassword, retryFailedOperation} from "./authManager.js";
 import {getOverallStats, getStatsFor} from "../misc/stats.js";
+import {
+    getShopQueueItemStatus,
+    processShopQueue,
+    queueBundles,
+    queueItemShop,
+    queueNightMarket
+} from "../valorant/shopQueue.js";
+import {sendConsoleOutput, setClient as setLoggerClient} from "../misc/logger.js";
 
 const client = new Client({
     intents: [Intents.FLAGS.GUILDS, Intents.FLAGS.GUILD_MESSAGES], // what intents does the bot need
@@ -65,6 +73,7 @@ client.on("ready", async () => {
     fetchData().then(() => console.log("Skins loaded!"));
 
     setClient(client);
+    setLoggerClient(client);
 
     scheduleTasks();
 
@@ -72,7 +81,7 @@ client.on("ready", async () => {
 });
 
 const scheduleTasks = () => {
-    console.debug("Scheduling tasks...");
+    console.log("Scheduling tasks...");
 
     // check alerts every day at 00:00:10 GMT
     if(config.refreshSkins) cronTasks.push(cron.schedule(config.refreshSkins, checkAlerts, {timezone: "GMT"}));
@@ -84,11 +93,17 @@ const scheduleTasks = () => {
     if(config.cleanupAccounts) cronTasks.push(cron.schedule(config.cleanupAccounts, cleanupAccounts));
 
     // if login queue is enabled, process an item every 3 seconds
-    if(config.useLoginQueue && config.loginQueue) cronTasks.push(cron.schedule(config.loginQueue, processQueue));
+    if(config.useLoginQueue && config.loginQueue) cronTasks.push(cron.schedule(config.loginQueue, processAuthQueue));
+
+    // if shop queue is enabled, process an item every second
+    if(config.useShopQueue && config.shopQueue) cronTasks.push(cron.schedule(config.shopQueue, processShopQueue));
+
+    // if send console to discord channel is enabled, send console output every 10 seconds
+    if(config.logToChannel && config.logFrequency) cronTasks.push(cron.schedule(config.logFrequency, sendConsoleOutput));
 }
 
 const destroyTasks = () => {
-    console.debug("Destroying scheduled tasks...");
+    console.log("Destroying scheduled tasks...");
     for(const task of cronTasks)
         task.stop();
     cronTasks.length = 0;
@@ -220,7 +235,7 @@ client.on("messageCreate", async (message) => {
 
         const content = message.content.replace(/<@!?\d+> ?/, ""); // remove @bot mention
         if(!content.startsWith('!')) return;
-        console.debug(`${message.author.tag} sent admin command ${content}`);
+        console.log(`${message.author.tag} sent admin command ${content}`);
 
         if(content === "!deploy guild") {
             if(!message.guild) return;
@@ -305,7 +320,7 @@ client.on("messageCreate", async (message) => {
             for(const guild of client.guilds.cache.values()) {
                 try {
                     const alerts = await alertsForGuild(guild.id);
-                    console.debug(`Found ${alerts.length} alerts for guild ${guild.name}`);
+                    console.log(`Found ${alerts.length} alerts for guild ${guild.name}`);
                     if(!alerts.length) continue;
 
                     const alertsPerChannel = {};
@@ -323,7 +338,7 @@ client.on("messageCreate", async (message) => {
                     if(channelWithMostAlerts[0] === null) continue;
 
                     const channel = await guild.channels.fetch(channelWithMostAlerts[0]);
-                    console.debug(`Channel with most alerts: #${channel.name} (${channelWithMostAlerts[1]} alerts)`);
+                    console.log(`Channel with most alerts: #${channel.name} (${channelWithMostAlerts[1]} alerts)`);
                     if(channel) await channel.send({
                         embeds: [messageEmbed]
                     });
@@ -375,7 +390,12 @@ client.on("interactionCreate", async (interaction) => {
                     // start uploading emoji now
                     const emojiPromise = VPEmoji(channel, externalEmojisAllowed(channel));
 
-                    const shop = await getOffers(interaction.user.id);
+                    let shop = await queueItemShop(interaction.user.id);
+                    while(shop.inQueue) {
+                        const queueStatus = getShopQueueItemStatus(shop.c);
+                        if(queueStatus.processed) shop = queueStatus.result;
+                        else await wait(150);
+                    }
 
                     const message = await renderOffers(shop, interaction, valorantUser, await emojiPromise);
                     await interaction.followUp(message);
@@ -395,7 +415,12 @@ client.on("interactionCreate", async (interaction) => {
                     const channel = interaction.channel || await client.channels.fetch(interaction.channelId);
                     const emojiPromise = VPEmoji(channel, externalEmojisAllowed(channel));
 
-                    const bundles = await getBundles(interaction.user.id);
+                    let bundles = await queueBundles(interaction.user.id);
+                    while(bundles.inQueue) {
+                        const queueStatus = getShopQueueItemStatus(bundles.c);
+                        if(queueStatus.processed) bundles = queueStatus.result;
+                        else await wait(150);
+                    }
 
                     const message = await renderBundles(bundles, interaction, await emojiPromise);
                     await interaction.followUp(message);
@@ -413,12 +438,15 @@ client.on("interactionCreate", async (interaction) => {
                     const channel = interaction.channel || await client.channels.fetch(interaction.channelId);
                     const emoji = await VPEmoji(channel, externalEmojisAllowed(channel));
 
+                    // if the name matches exactly, and there is only one with that name
+                    const nameMatchesExactly = (interaction) => searchResults.filter(r => l(r.names, interaction).toLowerCase() === searchQuery.toLowerCase()).length === 1;
+
                     if(searchResults.length === 0) {
                         return await interaction.followUp({
                             embeds: [basicEmbed(s(interaction).error.BUNDLE_NOT_FOUND)],
                             ephemeral: true
                         });
-                    } else if(searchResults.length === 1) {
+                    } else if(searchResults.length === 1 || nameMatchesExactly(interaction) || nameMatchesExactly()) { // check both localized and english
                         const bundle = searchResults[0];
                         const message = await renderBundle(bundle, interaction, emoji)
 
@@ -426,8 +454,7 @@ client.on("interactionCreate", async (interaction) => {
                     } else {
                         const row = new MessageActionRow();
 
-                        // reverse the array so that older bundles are first
-                        const options = searchResults.reverse().splice(0, 25).map(result => {
+                        const options = searchResults.splice(0, 25).map(result => {
                             return {
                                 label: l(result.names, interaction),
                                 value: `bundle-${result.uuid}`
@@ -467,7 +494,12 @@ client.on("interactionCreate", async (interaction) => {
                     const channel = interaction.channel || await client.channels.fetch(interaction.channelId);
                     const emojiPromise = VPEmoji(channel, externalEmojisAllowed(channel));
 
-                    const market = await getNightMarket(interaction.user.id);
+                    let market = await queueNightMarket(interaction.user.id);
+                    while(market.inQueue) {
+                        const queueStatus = getShopQueueItemStatus(market.c);
+                        if(queueStatus.processed) market = queueStatus.result;
+                        else await wait(150);
+                    }
 
                     const message = await renderNightMarket(market, interaction, valorantUser, await emojiPromise);
                     await interaction.followUp(message);
@@ -651,7 +683,7 @@ client.on("interactionCreate", async (interaction) => {
                     let success = await queueCookiesLogin(interaction.user.id, cookies);
 
                     while(success.inQueue) {
-                        const queueStatus = getQueueItemStatus(success.c);
+                        const queueStatus = getAuthQueueItemStatus(success.c);
                         if(queueStatus.processed) success = queueStatus.result;
                         else await wait(150);
                     }
@@ -913,6 +945,20 @@ client.on("interactionCreate", async (interaction) => {
                 });
 
                 await interaction.update(await allStatsEmbed(interaction, await getOverallStats(), parseInt(pageIndex)));
+            } else if(interaction.customId.startsWith("viewbundle")) {
+                const [, id, uuid] = interaction.customId.split('/');
+
+                if(id !== interaction.user.id) return await interaction.reply({
+                    embeds: [basicEmbed(s(interaction).error.NOT_UR_MESSAGE_BUNDLE)],
+                    ephemeral: true
+                });
+
+                const bundle = await getBundle(uuid);
+                const emoji = await VPEmoji(interaction.channel, externalEmojisAllowed(interaction.channel));
+                await interaction.update({
+                    components: [],
+                    ...await renderBundle(bundle, interaction, emoji),
+                });
             }
         } catch(e) {
             await handleError(e, interaction);

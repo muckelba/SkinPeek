@@ -105,24 +105,32 @@ export const renderBundles = async (bundles, interaction, VPemoji) => {
         color: VAL_COLOR_1
     }];
 
+    const buttons = [];
+
     for(const bundleData of bundles) {
-        const bundle = await getBundle(bundles[0].uuid);
+        const bundle = await getBundle(bundleData.uuid);
 
         const subName = bundle.subNames ? l(bundle.subNames, interaction) + "\n" : "";
         const slantedDescription = bundle.descriptions ? "*" + l(bundle.descriptions, interaction) + "*\n" : "";
-        const strikedBundleBasePrice = bundle.basePrice ? " ~~" + bundle.basePrice + "~~" : "";
         const embed = {
             title: s(interaction).info.BUNDLE_NAME.f({b: l(bundle.names, interaction)}),
-            description: `${subName}${slantedDescription}${emojiString} **${bundle.price}**${strikedBundleBasePrice} ${s(interaction).info.EXPIRES.f({t:bundle.expires})}`,
+            description: `${subName}${slantedDescription}${emojiString} **${bundle.price}** - ${s(interaction).info.EXPIRES.f({t:bundle.expires})}`,
             color: VAL_COLOR_2,
             thumbnail: {
                 url: bundle.icon
             }
         };
         embeds.push(embed);
+
+        if(buttons.length < 5) {
+            buttons.push(new MessageButton().setCustomId(`viewbundle/${interaction.user.id}/${bundle.uuid}`).setStyle("PRIMARY").setLabel(l(bundle.names, interaction)).setEmoji("🔎"));
+        }
     }
 
-    return {embeds};
+    return {
+        embeds: embeds,
+        components: [new MessageActionRow().addComponents(...buttons)]
+    };
 }
 
 export const renderBundle = async (bundle, interaction, emoji, includeExpires=true) => {
